@@ -1,0 +1,104 @@
+# This means no PR, no push will trigger this pipeline
+trigger: none
+pr: none
+
+schedules:
+- cron: "0 0 * * 1" # This will run the job at midnight every Monday
+  displayName: Weekly build on Monday
+  branches:
+    include:
+    - main
+  always: true  # This ensures the scheduled build always runs even if there are no code changes
+
+resources:
+- repo: self
+  clean: true
+  
+  
+variables:
+  TeamName: VSUnitTesting
+  IsTestRunningInCI: true
+  _DevDivDropAccessToken: $(System.AccessToken)
+  AppId: 7f2f729e-d17c-4394-bc89-157649b9f91b
+  TenantId: 72f988bf-86f1-41af-91ab-2d7cd011db47
+  
+stages:
+- stage: build
+  displayName: Build and Test
+  jobs:
+  - template: /eng/common/templates/jobs/jobs.yml
+    parameters:
+      enableMicrobuild: true
+      enablePublishBuildArtifacts: true
+      enablePublishTestResults: true
+      enablePublishBuildAssets: true
+      enablePublishUsingPipelines: $(_PublishUsingPipelines)
+      jobs:
+      - job: Windows_NT
+        pool:
+          ${{ if or(eq(variables['System.TeamProject'], 'public'), in(variables['Build.Reason'], 'PullRequest')) }}:
+            name: $(DncEngPublicBuildPool)
+            demands: ImageOverride -equals windows.vs2022.amd64.open
+          ${{ if and(ne(variables['System.TeamProject'], 'public'), notin(variables['Build.Reason'], 'PullRequest')) }}:
+            name: $(DncEngInternalBuildPool)
+            demands: ImageOverride -equals windows.vs2022.amd64
+        timeoutInMinutes: 90
+        variables:
+        # Enable signing for internal, non-PR builds
+        - ${{ if and(ne(variables['System.TeamProject'], 'public'), notin(variables['Build.Reason'], 'PullRequest')) }}:
+          - group: DotNet-Symbol-Server-Pats
+          - name: _SignType
+            value: Real
+          - name: _BuildArgs
+            value: /p:SignType=$(_SignType)
+                   /p:DotNetSignType=$(_SignType)
+                   /p:MicroBuild_SigningEnabled=true
+                   /p:TeamName=$(_TeamName)
+                   /p:DotNetPublishUsingPipelines=$(_PublishUsingPipelines)
+                   /p:DotNetArtifactsCategory=$(_DotNetArtifactsCategory)
+                   /p:DotNetSymbolServerTokenMsdl=$(microsoft-symbol-server-pat)
+                   /p:DotNetSymbolServerTokenSymWeb=$(symweb-symbol-server-pat)
+                   /p:OfficialBuildId=$(BUILD.BUILDNUMBER)
+                   /p:PublishToSymbolServer=true
+        # else
+        - ${{ if or(eq(variables['System.TeamProject'], 'public'), in(variables['Build.Reason'], 'PullRequest')) }}:
+          - name: _SignType
+            value: Test
+          - name: _BuildArgs
+            value: /p:SignType=$(_SignType)
+        steps:
+        - checkout: self
+          clean: true
+
+        # Azure DevOps doesn't support git symlinks on Windows so we have to fake it
+        - pwsh: . "$(Build.SourcesDirectory)\src\ensure-symlinks.ps1"
+          displayName: ensure symlinks
+
+        - task: NodeTool@0
+          displayName: Add NodeJS/npm
+          inputs:
+            versionSpec: $(NodeJSVersion)
+
+        - script: |
+            robocopy "eng\resources" "$(Build.SourcesDirectory)\artifacts"
+            :: robocopy return codes are terrible; 1 means files were copied
+            if "%errorlevel%" == "1" exit /b 0
+            exit /b 1
+          displayName: Prevent test directory crawling
+
+        - pwsh: |
+            $testArg = if ($env:SKIPTESTS -ne "true") { "-test" } else { "" }
+            Write-Host "##vso[task.setvariable variable=_TestArgs]$testArg"
+          displayName: Promote variables
+
+        - script: eng\CIBuild.cmd
+            -configuration $(_BuildConfig)
+            -prepareMachine
+            -sign
+            $(_BuildArgs)
+            $(_TestArgs)
+          displayName: Build
+          env:
+            POCKETLOGGER_LOG_PATH: $(PocketLoggerLogPath)
+            TRYDOTNET_PACKAGES_PATH: $(TryDotNetPackagesPath)
+            DOTNET_INTERACTIVE_FRONTEND_NAME: CI
